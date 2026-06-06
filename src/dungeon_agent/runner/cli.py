@@ -87,6 +87,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-turns", type=int, default=None, help="Maximum turns before stopping.")
     parser.add_argument("--model", type=str, default=None, help="Override model name.")
     parser.add_argument(
+        "--goal",
+        type=str,
+        default=None,
+        help="Override planner goal text for this run.",
+    )
+    parser.add_argument(
         "--checkpoint-interval",
         type=int,
         default=10,
@@ -180,6 +186,7 @@ def main() -> int:
         human_command_provider=_interactive_human_provider(args.human_command)
         if mode == "human-only"
         else _sequence_provider(args.human_command),
+        goal_text=args.goal,
         debug_output=settings.runtime.debug_output,
         turn_record_sink=turn_records.append if should_write_logs else None,
         hint_event_sink=hint_events.append if should_write_logs else None,

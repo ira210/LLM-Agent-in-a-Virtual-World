@@ -305,6 +305,39 @@ def _goal_world() -> WorldState:
     return world
 
 
+def _mirror_goal_world() -> WorldState:
+    foyer = Room(
+        room_id="foyer",
+        name="Foyer",
+        description="A drafty foyer with the dungeon exit marked by chalk.",
+        exits={Direction.NORTH: "vault"},
+        has_ambient_light=True,
+    )
+    vault = Room(
+        room_id="vault",
+        name="Vault",
+        description="A cramped vault packed with old lockboxes.",
+        exits={Direction.SOUTH: "foyer"},
+        has_ambient_light=True,
+    )
+    world = WorldState(
+        rooms={"foyer": foyer, "vault": vault},
+        items={
+            "obsidian_mirror": Item(
+                item_id="obsidian_mirror",
+                name="Obsidian Mirror",
+                short_description="an obsidian mirror rests in a cedar case",
+                detail="A polished mirror with a cold black surface.",
+                portable=True,
+            ),
+        },
+        player=PlayerState(current_room_id="foyer"),
+        exit_room_id="foyer",
+    )
+    world.place_item_in_room("obsidian_mirror", "vault")
+    return world
+
+
 def test_turn_limit_formula() -> None:
     assert compute_turn_limit(15) == 150
     assert compute_turn_limit(8) == 80
@@ -378,6 +411,11 @@ def test_cli_parser_accepts_mode_variants() -> None:
     assert parser.parse_args(["--mode", "human-only"]).mode == "human-only"
 
 
+def test_cli_parser_accepts_goal_override() -> None:
+    parser = build_parser()
+    assert parser.parse_args(["--goal", "Scout first"]).goal == "Scout first"
+
+
 def test_cli_agent_mode_fails_fast_without_openai_credentials(
     monkeypatch: object, capsys: object, tmp_path: object
 ) -> None:
@@ -448,6 +486,26 @@ def test_runner_selects_command_source_by_mode() -> None:
     )
     human_runner.run()
     assert human_engine.commands == ["N"]
+
+
+def test_runner_uses_custom_goal_text_for_intro_and_policy_input() -> None:
+    policy = _RecordingPolicy(command="LOOK")
+    printer = _IntroCapturingPrinter()
+    runner = Runner(
+        mode="agent-only",
+        seed=7,
+        max_turns=1,
+        engine=_StubEngine(),
+        policy=policy,
+        printer=printer,
+        goal_text="Map first, then recover the Sunshard.",
+    )
+
+    runner.run()
+
+    assert printer.intro_goal_text == "Map first, then recover the Sunshard."
+    assert len(policy.inputs) == 1
+    assert policy.inputs[0].goal_text == "Map first, then recover the Sunshard."
 
 
 def test_runner_loop_recovery_warns_then_overrides_repeated_look() -> None:
@@ -657,6 +715,21 @@ def test_runner_rewrites_take_single_letter_to_visible_light_item() -> None:
     assert engine.commands == ["TAKE LANTERN"]
 
 
+def test_runner_rewrites_examine_current_room_name_to_look() -> None:
+    engine = _StubEngine()
+    runner = Runner(
+        mode="agent-only",
+        seed=5,
+        max_turns=1,
+        engine=engine,
+        policy=_RecordingPolicy(command="EXAMINE STUB ROOM"),
+        printer=_SilentPrinter(),
+    )
+    runner.run()
+
+    assert engine.commands == ["LOOK"]
+
+
 def test_e2e_seeded_human_only_run_retrieves_treasure_and_exits() -> None:
     engine = _GoalAwareEngine(exit_room_id="foyer", treasure_item_id="sunshard_treasure")
     commands = ["north", "open chest", "take sunshard treasure", "south"]
@@ -677,6 +750,32 @@ def test_e2e_seeded_human_only_run_retrieves_treasure_and_exits() -> None:
     assert summary.turns_executed == 4
     assert summary.goal_completed is True
     assert summary.total_treasure_value == 250
+    assert summary.inventory_items == ("Sunshard Treasure",)
+    assert summary.locked_items == ()
+    assert summary.unlocked_items == ()
+
+
+def test_custom_goal_get_mirror_and_leave_completes_on_mirror_plus_exit() -> None:
+    engine = ParserExecutorEngine.from_world_template(_mirror_goal_world())
+    commands = ["north", "take obsidian mirror", "south"]
+    runner = Runner(
+        mode="human-only",
+        seed=11,
+        max_turns=10,
+        engine=engine,
+        policy=_RecordingPolicy(command="LOOK"),
+        human_command_provider=lambda turn_index, _obs: (
+            commands[turn_index] if turn_index < len(commands) else "LOOK"
+        ),
+        goal_text="get a mirror and leave",
+        printer=_SilentPrinter(),
+    )
+    summary = runner.run()
+
+    assert summary.terminal is True
+    assert summary.turns_executed == 3
+    assert summary.goal_completed is True
+    assert "Obsidian Mirror" in summary.inventory_items
 
 
 def test_console_summary_prints_victory_and_total_treasure_value_on_goal_completion(
@@ -699,3 +798,7 @@ def test_console_summary_prints_victory_and_total_treasure_value_on_goal_complet
     _ = runner.run()
     captured = capsys.readouterr()
     assert "Congratulations, you win! Total treasure value: 250." in captured.out
+    assert "Inventory: Sunshard Treasure" in captured.out
+    assert "Total value found: 250" in captured.out
+    assert "Locked items: none" in captured.out
+    assert "Unlocked items: none" in captured.out

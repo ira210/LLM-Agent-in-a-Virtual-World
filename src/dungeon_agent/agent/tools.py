@@ -333,6 +333,11 @@ class CommandValidator:
 
         if tokens[0] in {"L", "LOOK", "I", "INVENTORY", "MOVES", "TURNS", "HELP", "COMMANDS", "QUIT", "EXIT", "Q"}:
             if len(tokens) != 1:
+                if tokens[0] in {"L", "LOOK"}:
+                    return ValidationResult(
+                        validated_command=f"EXAMINE {' '.join(tokens[1:])}",
+                        action=ValidatorAction.REWRITTEN,
+                    )
                 return ValidationResult(validated_command="", action=ValidatorAction.REPLAN)
             if tokens[0] in {"L", "LOOK"}:
                 canonical = "LOOK"
@@ -351,6 +356,11 @@ class CommandValidator:
         if tokens[0] == "SEARCH":
             if len(tokens) == 1:
                 return ValidationResult(validated_command="SEARCH", action=ValidatorAction.REWRITTEN if rewritten else ValidatorAction.ACCEPTED)
+            if len(tokens) == 2:
+                corrected_direction = _correct_token_unambiguous(tokens[1], ALLOWED_DIRECTIONS)
+                if corrected_direction is not None:
+                    command = _canonicalize_direction(corrected_direction)
+                    return ValidationResult(validated_command=command, action=ValidatorAction.REWRITTEN)
             return ValidationResult(
                 validated_command=f"SEARCH {' '.join(tokens[1:])}",
                 action=ValidatorAction.REWRITTEN if rewritten else ValidatorAction.ACCEPTED,
@@ -369,6 +379,11 @@ class CommandValidator:
                 "WEAR": "WEAR",
                 "DON": "WEAR",
             }[tokens[0]]
+            if canonical_verb == "MOVE" and len(tokens) == 2:
+                corrected_direction = _correct_token_unambiguous(tokens[1], ALLOWED_DIRECTIONS)
+                if corrected_direction is not None:
+                    command = _canonicalize_direction(corrected_direction)
+                    return ValidationResult(validated_command=command, action=ValidatorAction.REWRITTEN)
             rewritten = rewritten or canonical_verb != tokens[0]
             return ValidationResult(
                 validated_command=f"{canonical_verb} {' '.join(tokens[1:])}",

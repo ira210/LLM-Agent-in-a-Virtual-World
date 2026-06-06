@@ -169,6 +169,32 @@ def test_command_validator_accepts_wear_aliases() -> None:
     assert validator.validate("don helm").validated_command == "WEAR HELM"
 
 
+def test_command_validator_rewrites_look_with_target_to_examine() -> None:
+    validator = CommandValidator()
+
+    result = validator.validate("LOOK WELL")
+    assert result.validated_command == "EXAMINE WELL"
+    assert result.action is ValidatorAction.REWRITTEN
+
+
+def test_command_validator_rewrites_move_direction_to_navigation() -> None:
+    validator = CommandValidator()
+
+    result = validator.validate("MOVE EAST")
+
+    assert result.validated_command == "E"
+    assert result.action is ValidatorAction.REWRITTEN
+
+
+def test_command_validator_rewrites_search_direction_to_navigation() -> None:
+    validator = CommandValidator()
+
+    result = validator.validate("SEARCH SOUTH")
+
+    assert result.validated_command == "S"
+    assert result.action is ValidatorAction.REWRITTEN
+
+
 def test_loop_recovery_triggers_on_three_repeated_commands() -> None:
     recovery = LoopRecovery()
     recovery.record_turn(command="look", room_id="r1")

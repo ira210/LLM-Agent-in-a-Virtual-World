@@ -50,6 +50,9 @@ class RunSummary:
     terminal: bool
     goal_completed: bool = False
     total_treasure_value: int = 0
+    inventory_items: tuple[str, ...] = ()
+    locked_items: tuple[str, ...] = ()
+    unlocked_items: tuple[str, ...] = ()
 
 
 class TurnPrinter(Protocol):
@@ -108,12 +111,18 @@ class ConsoleTurnPrinter:
 
     def write_summary(self, summary: RunSummary) -> None:
         status = "success" if summary.terminal else "turn-limit-reached"
+        inventory_text = ", ".join(summary.inventory_items) if summary.inventory_items else "none"
+        locked_text = ", ".join(summary.locked_items) if summary.locked_items else "none"
+        unlocked_text = ", ".join(summary.unlocked_items) if summary.unlocked_items else "none"
         if self._debug_output:
             if summary.goal_completed:
                 ui_print(
                     f"victory: congratulations, goal complete. total treasure value={summary.total_treasure_value}",
                     role="summary_success",
                 )
+            ui_print(f"inventory: {inventory_text}", role="debug")
+            ui_print(f"value-found: {summary.total_treasure_value}", role="debug")
+            ui_print(f"locks: locked={locked_text}; unlocked={unlocked_text}", role="debug")
             ui_print(
                 f"run-complete: mode={summary.mode} turns={summary.turns_executed}/"
                 f"{summary.max_turns} status={status}",
@@ -126,6 +135,10 @@ class ConsoleTurnPrinter:
                 f"Congratulations, you win! Total treasure value: {summary.total_treasure_value}.",
                 role="summary_success",
             )
+        ui_print(f"Inventory: {inventory_text}", role=role)
+        ui_print(f"Total value found: {summary.total_treasure_value}", role=role)
+        ui_print(f"Locked items: {locked_text}", role=role)
+        ui_print(f"Unlocked items: {unlocked_text}", role=role)
         ui_print(
             f"run-complete: turns={summary.turns_executed}/{summary.max_turns} status={status}",
             role=role,
@@ -149,7 +162,7 @@ class Runner:
         human_command_provider: Callable[[int, str], str | None] | None = None,
         printer: TurnPrinter | None = None,
         debug_output: bool = False,
-        goal_text: str = "Retrieve the treasure and exit the dungeon.",
+        goal_text: str | None = None,
         run_id: str | None = None,
         turn_record_sink: Callable[[TurnRecord], None] | None = None,
         hint_event_sink: Callable[[HumanHintEvent], None] | None = None,
@@ -170,6 +183,8 @@ class Runner:
         self._human_command_provider = human_command_provider
         self._printer = printer or ConsoleTurnPrinter(debug_output=debug_output)
         self._goal_text = goal_text
+        self._goal_target_item_ids: set[str] = set()
+        self._goal_requires_exit = True
         self._run_id = run_id or f"run-{seed}"
         self._turn_record_sink = turn_record_sink
         self._hint_event_sink = hint_event_sink
@@ -184,6 +199,7 @@ class Runner:
 
     def run(self) -> RunSummary:
         observation = self._engine.reset(seed=self._seed)
+        self._initialize_goal_objectives()
         intro_writer = getattr(self._printer, "write_intro", None)
         if callable(intro_writer):
             intro_writer(
@@ -286,6 +302,7 @@ class Runner:
                 break
 
         final_state_flags = self._read_state_flags()
+        inventory_items, locked_items, unlocked_items = self._summary_item_state()
         summary = RunSummary(
             mode=self._mode,
             turns_executed=turns_executed,
@@ -293,6 +310,9 @@ class Runner:
             terminal=terminal,
             goal_completed=self._goal_completed(final_state_flags),
             total_treasure_value=self._total_treasure_value(),
+            inventory_items=inventory_items,
+            locked_items=locked_items,
+            unlocked_items=unlocked_items,
         )
         self._printer.write_summary(summary)
         return summary
@@ -360,6 +380,7 @@ class Runner:
         state_flags = self._read_state_flags()
         policy_input = PolicyInput(
             observation_text=observation_text,
+            goal_text=self._resolve_goal_text(),
             human_input_text=human_input_text,
             loop_warning_text=loop_warning_text,
             is_dark=state_flags.is_dark,
@@ -385,7 +406,7 @@ class Runner:
         world = self._read_world()
         if world is None:
             return StateFlags()
-        has_treasure = any("treasure" in item_id for item_id in world.player.inventory)
+        has_treasure = self._has_goal_item(world)
         exit_room_id = getattr(self._engine, "_exit_room_id", None) or getattr(world, "exit_room_id", None)
         at_exit = bool(exit_room_id) and world.player.current_room_id == exit_room_id
         return StateFlags(
@@ -402,9 +423,11 @@ class Runner:
         return world.player.current_room_id
 
     def _resolve_goal_text(self) -> str:
+        if self._goal_text is not None and self._goal_text.strip():
+            return self._goal_text.strip()
         world = self._read_world()
         if world is None:
-            return self._goal_text
+            return "Retrieve the treasure and exit the dungeon."
         treasure_item_id = getattr(world, "objective_treasure_item_id", None)
         exit_room_id = getattr(world, "exit_room_id", None)
         treasure_name = "treasure"
@@ -418,15 +441,82 @@ class Runner:
             f"Secondary goal: retrieve the {treasure_name}. Complete this before {self._max_turns} moves run out."
         )
 
-    @staticmethod
-    def _goal_completed(state_flags: StateFlags) -> bool:
-        return state_flags.has_treasure and state_flags.at_exit
+    def _goal_completed(self, state_flags: StateFlags) -> bool:
+        if self._goal_requires_exit:
+            return state_flags.has_treasure and state_flags.at_exit
+        return state_flags.has_treasure
+
+    def _has_goal_item(self, world: object) -> bool:
+        inventory = getattr(getattr(world, "player", None), "inventory", set())
+        if self._goal_target_item_ids:
+            return any(item_id in inventory for item_id in self._goal_target_item_ids)
+        return any("treasure" in item_id for item_id in inventory)
+
+    def _initialize_goal_objectives(self) -> None:
+        world = self._read_world()
+        if world is None:
+            self._goal_target_item_ids = set()
+            self._goal_requires_exit = True
+            return
+        items = getattr(world, "items", {})
+        if not isinstance(items, dict):
+            self._goal_target_item_ids = set()
+            self._goal_requires_exit = True
+            return
+
+        default_targets = {item_id for item_id in items if "treasure" in item_id.lower()}
+        objective_treasure_item_id = getattr(world, "objective_treasure_item_id", None)
+        if isinstance(objective_treasure_item_id, str) and objective_treasure_item_id in items:
+            default_targets.add(objective_treasure_item_id)
+        if not default_targets:
+            default_targets = set(items.keys())
+
+        goal_text = (self._goal_text or "").strip()
+        if not goal_text:
+            self._goal_target_item_ids = default_targets
+            self._goal_requires_exit = True
+            return
+
+        goal_lower = goal_text.lower()
+        goal_tokens = {
+            token
+            for token in re.findall(r"[a-z0-9']+", goal_lower)
+            if token not in {"a", "an", "the", "and", "or", "to", "then", "first", "second"}
+        }
+        matched: set[str] = set()
+        for item_id, item in items.items():
+            item_name = getattr(item, "name", "")
+            item_tokens = set(re.findall(r"[a-z0-9']+", str(item_name).lower()))
+            if goal_tokens.intersection(item_tokens):
+                matched.add(item_id)
+        self._goal_target_item_ids = matched or default_targets
+        self._goal_requires_exit = bool(
+            re.search(r"\b(leave|exit|escape|return)\b", goal_lower)
+        )
 
     def _total_treasure_value(self) -> int:
         world = self._read_world()
         if world is None:
             return 0
         return sum(world.items[item_id].loot_value for item_id in world.player.inventory if item_id in world.items)
+
+    def _summary_item_state(self) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+        world = self._read_world()
+        if world is None or not hasattr(world, "items") or not hasattr(world, "player"):
+            return tuple(), tuple(), tuple()
+        items = getattr(world, "items", {})
+        inventory = getattr(getattr(world, "player", None), "inventory", set())
+        if not isinstance(items, dict):
+            return tuple(), tuple(), tuple()
+        inventory_items = tuple(
+            sorted(items[item_id].name for item_id in inventory if item_id in items)
+        )
+        lockable_items = [
+            item for item in items.values() if item.key_item_id is not None or item.is_locked
+        ]
+        locked_items = tuple(sorted(item.name for item in lockable_items if item.is_locked))
+        unlocked_items = tuple(sorted(item.name for item in lockable_items if not item.is_locked))
+        return inventory_items, locked_items, unlocked_items
 
     def _read_world(self) -> object | None:
         world = getattr(self._engine, "_world", None)
@@ -466,16 +556,25 @@ class Runner:
     def _rewrite_underspecified_command(*, emitted_command: str, observation_text: str) -> str:
         normalized = " ".join(emitted_command.strip().upper().split())
         match = re.match(r"^(TAKE|GET)\s+([A-Z])$", normalized)
-        if not match:
-            return emitted_command
-        initial = match.group(2)
-        visible_light_items = []
-        observation_upper = observation_text.upper()
-        if "LANTERN" in observation_upper:
-            visible_light_items.append("LANTERN")
-        if "LAMP" in observation_upper:
-            visible_light_items.append("LAMP")
-        candidates = tuple(item for item in visible_light_items if item.startswith(initial))
-        if len(candidates) == 1:
-            return f"TAKE {candidates[0]}"
+        if match:
+            initial = match.group(2)
+            visible_light_items = []
+            observation_upper = observation_text.upper()
+            if "LANTERN" in observation_upper:
+                visible_light_items.append("LANTERN")
+            if "LAMP" in observation_upper:
+                visible_light_items.append("LAMP")
+            candidates = tuple(item for item in visible_light_items if item.startswith(initial))
+            if len(candidates) == 1:
+                return f"TAKE {candidates[0]}"
+
+        examine_match = re.match(r"^EXAMINE\s+(.+)$", normalized)
+        if examine_match:
+            room_match = re.match(r"^([^.]+)\.", " ".join(observation_text.split()))
+            if room_match:
+                room_name = room_match.group(1).strip().upper()
+                target_name = examine_match.group(1).strip().upper()
+                target_name = re.sub(r"^(THE|A|AN)\s+", "", target_name)
+                if target_name == room_name:
+                    return "LOOK"
         return emitted_command

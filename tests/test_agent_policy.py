@@ -515,8 +515,10 @@ def test_openai_policy_escapes_room_after_repeated_failed_item_fiddling(
         )
     )
 
-    assert proposed == "E"
-    assert client.responses.calls == 0
+    assert proposed == "SEARCH WELL"
+    assert client.responses.calls == 1
+    user_prompt = client.responses.calls_kwargs[0]["input"][2]["content"]
+    assert "Avoid repeating known failed commands in this room" in user_prompt
 
 
 def test_openai_policy_immediately_pivots_after_already_moved_result(
@@ -548,8 +550,44 @@ def test_openai_policy_immediately_pivots_after_already_moved_result(
         )
     )
 
-    assert proposed == "E"
-    assert client.responses.calls == 0
+    assert proposed == "MOVE CHALK STUB"
+    assert client.responses.calls == 1
+    user_prompt = client.responses.calls_kwargs[0]["input"][2]["content"]
+    assert "Avoid repeating known failed commands in this room: MOVE CHALK STUB." in user_prompt
+
+
+def test_openai_policy_unblocks_open_after_successful_key_use(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "test-project")
+
+    client = _FakeClient("COMMAND: OPEN PRAYER CHEST")
+    policy = OpenAIAgentPolicy(model_name="gpt-5-mini", client=client)
+    policy.record_turn_feedback(
+        emitted_command="OPEN PRAYER CHEST",
+        observation_text="Sanctum. Exits lead north, east.",
+        result_text="The prayer chest is locked.",
+    )
+    policy.record_turn_feedback(
+        emitted_command="USE VAULT KEY ON PRAYER CHEST",
+        observation_text="Sanctum. Exits lead north, east.",
+        result_text="You unlock the prayer chest with the vault key.",
+    )
+    proposed = policy.propose_command(
+        PolicyInput(
+            observation_text=(
+                "Sanctum. Exits lead north, east. "
+                "You notice a prayer chest rests beneath the winch."
+            ),
+            use_exploration_assist=True,
+            command_reference_text="N|S|E|W",
+        )
+    )
+
+    assert proposed == "OPEN PRAYER CHEST"
+    assert client.responses.calls == 1
 
 
 def test_openai_policy_pivots_after_repeated_examine_same_target(
@@ -582,8 +620,117 @@ def test_openai_policy_pivots_after_repeated_examine_same_target(
         )
     )
 
-    assert proposed == "E"
-    assert client.responses.calls == 0
+    assert proposed == "EXAMINE CHALK STUB"
+    assert client.responses.calls == 1
+    user_prompt = client.responses.calls_kwargs[0]["input"][2]["content"]
+    assert "Recent repetition: 'EXAMINE CHALK STUB' was already used in this room." in user_prompt
+
+
+def test_openai_policy_warns_on_immediate_duplicate_examine_in_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "test-project")
+
+    client = _FakeClient("COMMAND: EXAMINE CHALK STUB")
+    policy = OpenAIAgentPolicy(model_name="gpt-5-mini", client=client)
+    policy.record_turn_feedback(
+        emitted_command="EXAMINE CHALK STUB",
+        observation_text=(
+            "Entry Vestibule. Exits lead north, south, east. "
+            "You notice a snapped chalk stub lies near the doorway."
+        ),
+        result_text="A snapped chalk stub worn smooth by handling.",
+    )
+
+    proposed = policy.propose_command(
+        PolicyInput(
+            observation_text=(
+                "Entry Vestibule. Exits lead north, south, east. "
+                "You notice a snapped chalk stub lies near the doorway."
+            ),
+            use_exploration_assist=True,
+            command_reference_text="N|S|E|W",
+        )
+    )
+
+    first_call_input = client.responses.calls_kwargs[0]["input"]
+    assert isinstance(first_call_input, list)
+    user_prompt = first_call_input[2]["content"]
+    assert "Recent repetition: 'EXAMINE CHALK STUB' was already used in this room." in user_prompt
+    assert proposed == "EXAMINE CHALK STUB"
+    assert client.responses.calls == 1
+
+
+def test_openai_policy_warns_after_nonconsecutive_repeated_examine_in_same_room(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "test-project")
+
+    client = _FakeClient("COMMAND: EXAMINE CHALK STUB")
+    policy = OpenAIAgentPolicy(model_name="gpt-5-mini", client=client)
+    observation = (
+        "Entry Vestibule. Exits lead north, south, west. "
+        "You notice a snapped chalk stub lies near the doorway; a tarnished tapestry hangs crooked on iron hooks."
+    )
+    policy.record_turn_feedback(
+        emitted_command="EXAMINE CHALK STUB",
+        observation_text=observation,
+        result_text="A snapped chalk stub worn smooth by handling.",
+    )
+    policy.record_turn_feedback(
+        emitted_command="EXAMINE TAPESTRY",
+        observation_text=observation,
+        result_text="A tarnished tapestry crusted with mildew.",
+    )
+    _ = policy.propose_command(
+        PolicyInput(
+            observation_text=observation,
+            use_exploration_assist=True,
+            command_reference_text="N|S|E|W",
+        )
+    )
+
+    assert client.responses.calls == 1
+    user_prompt = client.responses.calls_kwargs[0]["input"][2]["content"]
+    assert "You already examined these targets in this unchanged room" in user_prompt
+    assert "EXAMINE CHALK STUB" in user_prompt
+    assert "EXAMINE TAPESTRY" in user_prompt
+
+
+def test_openai_policy_warns_on_revisiting_unchanged_room_with_prior_commands(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "test-project")
+
+    client = _FakeClient("COMMAND: EXAMINE PRAYER CHEST")
+    policy = OpenAIAgentPolicy(model_name="gpt-5-mini", client=client)
+    observation = (
+        "Moonwell Sanctum. Exits lead south, west. "
+        "You notice an obsidian mirror rests in a cedar case; a prayer chest rests beneath the winch."
+    )
+    policy.record_turn_feedback(
+        emitted_command="EXAMINE PRAYER CHEST",
+        observation_text=observation,
+        result_text="A cedar chest with iron corners and a narrow lockplate. It is locked.",
+    )
+
+    _ = policy.propose_command(
+        PolicyInput(
+            observation_text=observation,
+            use_exploration_assist=True,
+            command_reference_text="N|S|E|W",
+        )
+    )
+
+    user_prompt = client.responses.calls_kwargs[0]["input"][2]["content"]
+    assert "Room appears unchanged since your last visit." in user_prompt
+    assert "EXAMINE PRAYER CHEST" in user_prompt
 
 
 def test_openai_policy_sets_find_key_subgoal_when_lock_known_and_no_key(
@@ -644,5 +791,143 @@ def test_openai_policy_avoids_blocked_room_command_on_revisit(
         )
     )
 
-    assert proposed == "E"
+    assert proposed == "SEARCH WELL"
     assert client.responses.calls == 1
+    user_prompt = client.responses.calls_kwargs[0]["input"][2]["content"]
+    assert "Avoid repeating known failed commands in this room: SEARCH WELL." in user_prompt
+
+
+def test_openai_policy_avoids_reopening_known_locked_target(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "test-project")
+
+    client = _FakeClient("COMMAND: OPEN PRAYER CHEST")
+    policy = OpenAIAgentPolicy(model_name="gpt-5-mini", client=client)
+    policy.record_turn_feedback(
+        emitted_command="OPEN PRAYER CHEST",
+        observation_text="Sanctum. Exits lead north, east.",
+        result_text="The prayer chest is locked.",
+    )
+    proposed = policy.propose_command(
+        PolicyInput(
+            observation_text="Sanctum. Exits lead north, east.",
+            use_exploration_assist=True,
+            command_reference_text="N|S|E|W",
+        )
+    )
+
+    assert proposed == "E"
+    assert client.responses.calls == 0
+
+
+def test_openai_policy_warns_after_do_not_see_result_for_room_command(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "test-project")
+
+    client = _FakeClient("COMMAND: EXAMINE COFFER")
+    policy = OpenAIAgentPolicy(model_name="gpt-5-mini", client=client)
+    observation = (
+        "Well of Whispers. Exits lead north, south. "
+        "You notice a chain hook dangles from the pulley axle; a dented bucket hangs over the dry shaft."
+    )
+    policy.record_turn_feedback(
+        emitted_command="EXAMINE COFFER",
+        observation_text=observation,
+        result_text="You do not see 'coffer' here.",
+    )
+    _ = policy.propose_command(
+        PolicyInput(
+            observation_text=observation,
+            use_exploration_assist=True,
+            command_reference_text="N|S|E|W",
+        )
+    )
+
+    assert client.responses.calls == 1
+    user_prompt = client.responses.calls_kwargs[0]["input"][2]["content"]
+    assert "Avoid repeating known failed commands in this room: EXAMINE COFFER." in user_prompt
+
+
+def test_openai_policy_rewrites_search_direction_to_navigation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "test-project")
+
+    client = _FakeClient("COMMAND: SEARCH SOUTH")
+    policy = OpenAIAgentPolicy(model_name="gpt-5-mini", client=client)
+    proposed = policy.propose_command(
+        PolicyInput(
+            observation_text=(
+                "Vault Antechamber. Exits lead south, west. "
+                "You notice an ironbound coffer sits on the dais."
+            ),
+            use_exploration_assist=True,
+            command_reference_text="N|S|E|W",
+        )
+    )
+
+    assert proposed == "S"
+    assert client.responses.calls == 1
+
+
+def test_openai_policy_blocks_take_target_not_present_here(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "test-project")
+
+    client = _FakeClient("COMMAND: TAKE MASON'S HAMMER")
+    policy = OpenAIAgentPolicy(model_name="gpt-5-mini", client=client)
+    proposed = policy.propose_command(
+        PolicyInput(
+            observation_text=(
+                "Vault Antechamber. Exits lead south, west. "
+                "You notice an ironbound coffer sits on the dais."
+            ),
+            use_exploration_assist=True,
+            command_reference_text="N|S|E|W",
+        )
+    )
+
+    assert proposed == "S"
+    assert client.responses.calls == 1
+
+
+def test_openai_policy_avoids_retaking_known_non_portable_item(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "test-project")
+
+    client = _FakeClient("COMMAND: TAKE DENTED BUCKET")
+    policy = OpenAIAgentPolicy(model_name="gpt-5-mini", client=client)
+    policy.record_turn_feedback(
+        emitted_command="TAKE DENTED BUCKET",
+        observation_text="Well of Whispers. Exits lead north, east.",
+        result_text="item 'dented_bucket' is not portable",
+    )
+    proposed = policy.propose_command(
+        PolicyInput(
+            observation_text=(
+                "Well of Whispers. Exits lead north, east. "
+                "You notice a dented bucket hangs over the dry shaft."
+            ),
+            use_exploration_assist=True,
+            command_reference_text="N|S|E|W",
+        )
+    )
+
+    assert proposed == "TAKE DENTED BUCKET"
+    assert client.responses.calls == 1
+    user_prompt = client.responses.calls_kwargs[0]["input"][2]["content"]
+    assert "Avoid repeating known failed commands in this room: TAKE DENTED BUCKET." in user_prompt

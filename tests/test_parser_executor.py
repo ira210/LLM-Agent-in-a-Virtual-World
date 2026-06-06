@@ -187,6 +187,15 @@ def test_targeted_search_in_lit_room_provides_relation_hints() -> None:
     assert "try move crate" in post_open
 
 
+def test_search_current_room_name_is_treated_as_search_room() -> None:
+    engine = ParserExecutorEngine.from_world_template(_build_world(ambient_light=True))
+    engine.reset(seed=9)
+
+    by_name = engine.step("SEARCH CELLAR").result_text.lower()
+    by_room = engine.step("SEARCH ROOM").result_text.lower()
+    assert by_name == by_room
+
+
 def test_take_command_uses_permissive_item_matching() -> None:
     engine = ParserExecutorEngine.from_world_template(_build_world(ambient_light=True))
     engine.reset(seed=13)
@@ -224,6 +233,33 @@ def test_take_matching_normalizes_curly_and_straight_apostrophes() -> None:
     engine.reset(seed=1)
 
     assert "take the mason's hammer" in engine.step("TAKE MASON'S HAMMER").result_text.lower()
+
+
+def test_examine_matching_normalizes_modifier_apostrophe_variant() -> None:
+    room = Room(
+        room_id="workshop",
+        name="Workshop",
+        description="A tool room.",
+        exits={},
+        has_ambient_light=True,
+    )
+    world = WorldState(
+        rooms={"workshop": room},
+        items={
+            "mason_hammer": Item(
+                item_id="mason_hammer",
+                name="Mason's Hammer",
+                short_description="a mason’s hammer lies beside loose stone",
+                detail="A heavy hammer chipped from years of use.",
+            )
+        },
+        player=PlayerState(current_room_id="workshop"),
+    )
+    world.place_item_in_room("mason_hammer", "workshop")
+    engine = ParserExecutorEngine.from_world_template(world)
+    engine.reset(seed=1)
+
+    assert "heavy hammer" in engine.step("EXAMINE MASONʼS HAMMER").result_text.lower()
 
 
 def test_help_and_commands_alias_return_syntax_reference() -> None:

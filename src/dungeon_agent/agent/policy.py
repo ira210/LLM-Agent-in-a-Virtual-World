@@ -28,6 +28,7 @@ from dungeon_agent.schemas import StateFlags
 @dataclass(frozen=True, slots=True)
 class PolicyInput:
     observation_text: str
+    goal_text: str | None = None
     human_input_text: str | None = None
     loop_warning_text: str | None = None
     is_dark: bool | None = None
@@ -109,6 +110,9 @@ class OpenAIAgentPolicy:
         self._recent_results: deque[str] = deque(maxlen=8)
         self._recent_outcomes: deque[tuple[str, str, str]] = deque(maxlen=24)
         self._blocked_room_commands: dict[str, set[str]] = {}
+        self._room_attempted_commands: dict[str, set[str]] = {}
+        self._room_last_observation: dict[str, str] = {}
+        self._room_examine_counts: dict[str, dict[str, int]] = {}
 
     def record_turn_feedback(
         self, *, emitted_command: str, observation_text: str, result_text: str
@@ -154,8 +158,22 @@ class OpenAIAgentPolicy:
             self._recent_results.append(f"{emitted}: {compact_result}"[:220])
             if room_id:
                 self._recent_outcomes.append((room_id, emitted, compact_result))
+                self._room_attempted_commands.setdefault(room_id, set()).add(emitted)
+                fingerprint = _normalize_observation_fingerprint(observation_text)
+                previous_fingerprint = self._room_last_observation.get(room_id)
+                if previous_fingerprint != fingerprint:
+                    self._room_examine_counts[room_id] = {}
+                self._room_last_observation[room_id] = fingerprint
+                if emitted.startswith("EXAMINE ") and "parser error" not in lowered:
+                    room_counts = self._room_examine_counts.setdefault(room_id, {})
+                    room_counts[emitted] = room_counts.get(emitted, 0) + 1
                 if _is_persistent_non_progress_result(compact_result, command=emitted):
                     self._blocked_room_commands.setdefault(room_id, set()).add(emitted)
+                self._update_blocked_commands_after_progress(
+                    room_id=room_id,
+                    command=emitted,
+                    result_text=compact_result,
+                )
 
     def propose_command(self, payload: PolicyInput) -> str:
         room_id, exits, item_descriptors = _parse_observation(payload.observation_text)
@@ -188,43 +206,6 @@ class OpenAIAgentPolicy:
                 return light_command
 
         history = self._history.last(4)
-        repeat_escape_command = _repeat_failure_escape_command(
-            payload=payload,
-            current_room=room_id,
-            exits=exits,
-            map_memory=self._map,
-            history=history,
-            recent_outcomes=tuple(self._recent_outcomes),
-        )
-        if repeat_escape_command is not None:
-            self._debug(f"repeat-failure escape command selected: {repeat_escape_command}")
-            return repeat_escape_command
-
-        stagnation_command = _stagnation_escape_command(
-            payload=payload,
-            current_room=room_id,
-            exits=exits,
-            map_memory=self._map,
-            history=history,
-            recent_outcomes=tuple(self._recent_outcomes),
-        )
-        if stagnation_command is not None:
-            self._debug(f"stagnation escape command selected: {stagnation_command}")
-            return stagnation_command
-
-        key_hunt_command = _key_hunt_command(
-            payload=payload,
-            current_room=room_id,
-            exits=exits,
-            item_descriptors=item_descriptors,
-            map_memory=self._map,
-            world_memory=self._world,
-            history=history,
-        )
-        if key_hunt_command is not None:
-            self._debug(f"key-hunt command selected: {key_hunt_command}")
-            return key_hunt_command
-
         exploration_command = _exploration_assist_command(
             payload=payload,
             current_room=room_id,
@@ -256,17 +237,82 @@ class OpenAIAgentPolicy:
         )
         hint_text = payload.human_input_text or "None"
         loop_warning_text = payload.loop_warning_text or "None"
+        non_progress_warning = _non_progress_warning_text(
+            current_room=room_id,
+            history=history,
+            recent_outcomes=tuple(self._recent_outcomes),
+        )
+        blocked_commands_warning = _blocked_commands_warning_text(
+            current_room=room_id,
+            blocked_room_commands=self._blocked_room_commands,
+        )
+        room_repeat_warning = _room_repeat_warning_text(
+            current_room=room_id,
+            observation_text=payload.observation_text,
+            room_attempted_commands=self._room_attempted_commands,
+            room_last_observation=self._room_last_observation,
+        )
+        repeated_examine_warning = _repeated_examine_warning_text(
+            current_room=room_id,
+            observation_text=payload.observation_text,
+            room_examine_counts=self._room_examine_counts,
+            room_last_observation=self._room_last_observation,
+        )
+        if non_progress_warning:
+            if loop_warning_text == "None":
+                loop_warning_text = non_progress_warning
+            else:
+                loop_warning_text = f"{loop_warning_text} {non_progress_warning}"
+        if blocked_commands_warning:
+            if loop_warning_text == "None":
+                loop_warning_text = blocked_commands_warning
+            else:
+                loop_warning_text = f"{loop_warning_text} {blocked_commands_warning}"
+        if room_repeat_warning:
+            if loop_warning_text == "None":
+                loop_warning_text = room_repeat_warning
+            else:
+                loop_warning_text = f"{loop_warning_text} {room_repeat_warning}"
+        if repeated_examine_warning:
+            if loop_warning_text == "None":
+                loop_warning_text = repeated_examine_warning
+            else:
+                loop_warning_text = f"{loop_warning_text} {repeated_examine_warning}"
         environment_flags = (
             f"is_dark={payload.is_dark if payload.is_dark is not None else 'unknown'}; "
             f"has_light={payload.has_light if payload.has_light is not None else 'unknown'}"
         )
         command_reference = payload.command_reference_text or CommandReference.text()
+        frontier_guidance = (
+            {
+                "unexplored_exits_here": list(self._map.unexplored_exits(room_id)),
+                "path_to_nearest_frontier": list(self._map.path_to_nearest_frontier(room_id)),
+            }
+            if room_id is not None
+            else {"unexplored_exits_here": [], "path_to_nearest_frontier": []}
+        )
+        recent_failed_commands_here = (
+            sorted(self._blocked_room_commands.get(room_id, set())) if room_id is not None else []
+        )
+        attempted_commands_here = (
+            sorted(self._room_attempted_commands.get(room_id, set()))[-8:] if room_id is not None else []
+        )
+        examined_commands_here = (
+            sorted(self._room_examine_counts.get(room_id, {}))[-8:] if room_id is not None else []
+        )
         state_payload = {
             "observation": payload.observation_text,
+            "goal": payload.goal_text or "None",
+            "visible_item_descriptors_here": list(item_descriptors),
             "human_hint": hint_text,
             "loop_warning": loop_warning_text,
             "environment_flags": environment_flags,
             "memory_summary": memory_summary,
+            "frontier_guidance": frontier_guidance,
+            "known_locked_targets": sorted(self._world.locked_targets),
+            "recent_failed_commands_here": recent_failed_commands_here,
+            "attempted_commands_here": attempted_commands_here,
+            "examined_commands_here": examined_commands_here,
             "command_reference": command_reference,
         }
         user_prompt = (
@@ -354,15 +400,20 @@ class OpenAIAgentPolicy:
                 self._debug("response truncated at max_output_tokens")
             retries += 1
         if command:
-            command = self._avoid_blocked_room_command(
+            self._debug(f"command selected: {command}")
+            guarded_command = _guard_room_context_command(
                 command=command,
+                observation_text=payload.observation_text,
                 current_room=room_id,
                 exits=exits,
+                item_descriptors=item_descriptors,
                 map_memory=self._map,
                 history=history,
+                use_exploration_assist=payload.use_exploration_assist,
             )
-            self._debug(f"command selected: {command}")
-            return command
+            if guarded_command != command:
+                self._debug(f"context guard rewrote command: {command} -> {guarded_command}")
+            return guarded_command
         if _response_hit_max_output_tokens(response):
             rescue_command = self._rescue_command_after_truncation(
                 observation_text=payload.observation_text,
@@ -373,23 +424,9 @@ class OpenAIAgentPolicy:
                 environment_flags=environment_flags,
             )
             if rescue_command:
-                rescue_command = self._avoid_blocked_room_command(
-                    command=rescue_command,
-                    current_room=room_id,
-                    exits=exits,
-                    map_memory=self._map,
-                    history=history,
-                )
                 self._debug(f"rescue command selected: {rescue_command}")
                 return rescue_command
         fallback = _deterministic_fallback_command(payload.observation_text)
-        fallback = self._avoid_blocked_room_command(
-            command=fallback,
-            current_room=room_id,
-            exits=exits,
-            map_memory=self._map,
-            history=history,
-        )
         self._debug(f"fallback command selected: {fallback}")
         return fallback
 
@@ -428,13 +465,17 @@ class OpenAIAgentPolicy:
             "You are a dungeon planner.\n"
             "Plan loop each turn:\n"
             "1) Read current observation and compact memory.\n"
-            "2) Use tools only when they improve certainty.\n"
-            "3) Prefer meaningful progress: prioritize exploring/mapping new rooms; treat treasure as secondary.\n"
-            "4) Avoid repeated failed interactions with the same target; pivot to exploration.\n"
-            "5) Never abbreviate object names (e.g. use TAKE LANTERN, not TAKE L).\n"
-            "6) Use concise noun targets only; do not include full descriptive clauses from room text.\n"
-            "7) If dark and you have no light, prioritize obtaining light.\n"
-            "8) Output exactly one command.\n"
+            "2) Prefer get_frontier_guidance and get_recent_results to avoid loops and revisit waste.\n"
+            "3) Use get_world_notes when lock/key clues exist. Avoid get_current_context-style restatements.\n"
+            "4) Use tools only when they improve certainty.\n"
+            "5) Follow the `goal` in turn state while still avoiding loops and invalid actions.\n"
+            "6) Avoid repeated failed interactions with the same target; pivot to exploration.\n"
+            "7) Only interact with objects visible in the current room observation (or in inventory when using items). "
+            "Do not target remembered objects from other rooms unless you first move there.\n"
+            "8) Never abbreviate object names (e.g. use TAKE LANTERN, not TAKE L).\n"
+            "9) Use concise noun targets only; do not include full descriptive clauses from room text.\n"
+            "10) If dark and you have no light, prioritize obtaining light.\n"
+            "11) Output exactly one command.\n"
             "Output format (exactly):\n"
             "COMMAND: <one command>\n"
             "SCRATCHPAD: <short reasoning, one line>\n"
@@ -446,29 +487,24 @@ class OpenAIAgentPolicy:
             return
         ui_print(f"[agent-debug] {message}", role="agent_debug")
 
-    def _avoid_blocked_room_command(
+    def _update_blocked_commands_after_progress(
         self,
         *,
+        room_id: str,
         command: str,
-        current_room: str | None,
-        exits: tuple[str, ...],
-        map_memory: MapMemory,
-        history: tuple[tuple[str, str], ...],
-    ) -> str:
-        if current_room is None:
-            return command
-        normalized = " ".join(command.strip().upper().split())
-        blocked = self._blocked_room_commands.get(current_room, set())
-        if normalized not in blocked:
-            return command
-        escaped = _movement_escape_command(
-            current_room=current_room,
-            exits=exits,
-            map_memory=map_memory,
-            history=history,
-        )
-        self._debug(f"blocked prior non-progress command '{normalized}', pivoting to {escaped}")
-        return escaped
+        result_text: str,
+    ) -> None:
+        blocked = self._blocked_room_commands.get(room_id)
+        if not blocked:
+            return
+        lowered_result = result_text.lower()
+        if command.startswith("OPEN ") and " is locked" not in lowered_result:
+            blocked.discard(command)
+        if command.startswith("USE ") and " ON " in command and "unlock the " in lowered_result:
+            target = command.split(" ON ", 1)[1].strip()
+            blocked.discard(f"OPEN {target}")
+        if not blocked:
+            self._blocked_room_commands.pop(room_id, None)
 
     def _rescue_command_after_truncation(
         self,
@@ -630,16 +666,6 @@ class OpenAIAgentPolicy:
 
     def _policy_tool_definitions(self) -> list[dict[str, object]]:
         return [
-            {
-                "type": "function",
-                "name": "get_current_context",
-                "description": "Get current room context including exits, visible items, and searched targets.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": False,
-                },
-            },
             {
                 "type": "function",
                 "name": "get_recent_history",
@@ -894,51 +920,6 @@ def _needs_key_subgoal(*, world_memory: WorldMemory) -> bool:
     return not any("key" in item_name for item_name in world_memory.seen_inventory)
 
 
-def _key_hunt_command(
-    *,
-    payload: PolicyInput,
-    current_room: str | None,
-    exits: tuple[str, ...],
-    item_descriptors: tuple[str, ...],
-    map_memory: MapMemory,
-    world_memory: WorldMemory,
-    history: tuple[tuple[str, str], ...],
-) -> str | None:
-    if payload.human_input_text or payload.loop_warning_text:
-        return None
-    if not payload.use_exploration_assist:
-        return None
-    if current_room is None:
-        return None
-    if not _needs_key_subgoal(world_memory=world_memory):
-        return None
-
-    for descriptor in item_descriptors:
-        lowered = descriptor.lower()
-        if " key" in lowered or lowered.endswith("key"):
-            if "coffer key" in lowered:
-                return "TAKE COFFER KEY"
-            if "vault key" in lowered:
-                return "TAKE VAULT KEY"
-            return "TAKE KEY"
-    if "ROOM" not in world_memory.searched_targets_for_room(current_room):
-        return "SEARCH ROOM"
-    for room_id, remembered_items in world_memory.seen_items_by_room.items():
-        if room_id == current_room:
-            continue
-        if not any(" key" in descriptor.lower() or descriptor.lower().endswith("key") for descriptor in remembered_items):
-            continue
-        path = map_memory.path_to(current_room, room_id)
-        if path:
-            return path[0]
-    return _movement_escape_command(
-        current_room=current_room,
-        exits=exits,
-        map_memory=map_memory,
-        history=history,
-    )
-
-
 def _fast_path_command(
     *,
     payload: PolicyInput,
@@ -1148,11 +1129,176 @@ def _is_persistent_non_progress_result(result_text: str, *, command: str) -> boo
     lowered = result_text.lower()
     if any(phrase in lowered for phrase in ("already moved", "already open", "already wearing")):
         return True
+    if command.startswith("OPEN ") and " is locked" in lowered:
+        return True
+    if (command.startswith("TAKE ") or command.startswith("GET ")) and "not portable" in lowered:
+        return True
+    if command.startswith(("EXAMINE ", "OPEN ", "MOVE ", "TAKE ", "GET ", "SEARCH ", "USE ")) and "do not see" in lowered:
+        return True
     if command.startswith("SEARCH ") and any(phrase in lowered for phrase in ("find nothing", "nothing unusual")):
         return True
     if command.startswith("EXAMINE ") and "part of the scenery" in lowered:
         return True
     return False
+
+
+def _non_progress_warning_text(
+    *,
+    current_room: str | None,
+    history: tuple[tuple[str, str], ...],
+    recent_outcomes: tuple[tuple[str, str, str], ...],
+) -> str | None:
+    if current_room is None or not history or not recent_outcomes:
+        return None
+    last_room, last_command, last_result = recent_outcomes[-1]
+    if last_room != current_room:
+        return None
+    if history[-1][0] != last_command:
+        return None
+    if last_command.startswith("EXAMINE "):
+        return (
+            f"Recent repetition: '{last_command}' was already used in this room. "
+            "Choose a different action."
+        )
+    if not _is_non_progress_result(last_result):
+        return None
+    return (
+        f"Recent non-progress: '{last_command}' in this room already failed "
+        f"('{last_result}'). Choose a different action."
+    )
+
+
+def _blocked_commands_warning_text(
+    *,
+    current_room: str | None,
+    blocked_room_commands: dict[str, set[str]],
+) -> str | None:
+    if current_room is None:
+        return None
+    blocked = sorted(blocked_room_commands.get(current_room, set()))
+    if not blocked:
+        return None
+    limited = ", ".join(blocked[:4])
+    return (
+        "Avoid repeating known failed commands in this room: "
+        f"{limited}. Choose a different action."
+    )
+
+
+def _room_repeat_warning_text(
+    *,
+    current_room: str | None,
+    observation_text: str,
+    room_attempted_commands: dict[str, set[str]],
+    room_last_observation: dict[str, str],
+) -> str | None:
+    if current_room is None:
+        return None
+    attempted = sorted(room_attempted_commands.get(current_room, set()))
+    if not attempted:
+        return None
+    fingerprint = _normalize_observation_fingerprint(observation_text)
+    previous = room_last_observation.get(current_room)
+    if previous != fingerprint:
+        return None
+    listed = ", ".join(attempted[:6])
+    return (
+        "Room appears unchanged since your last visit. "
+        f"Avoid repeating prior commands here ({listed}) unless new evidence appears."
+    )
+
+
+def _repeated_examine_warning_text(
+    *,
+    current_room: str | None,
+    observation_text: str,
+    room_examine_counts: dict[str, dict[str, int]],
+    room_last_observation: dict[str, str],
+) -> str | None:
+    if current_room is None:
+        return None
+    fingerprint = _normalize_observation_fingerprint(observation_text)
+    previous = room_last_observation.get(current_room)
+    if previous != fingerprint:
+        return None
+    examined = sorted(room_examine_counts.get(current_room, {}))
+    if not examined:
+        return None
+    listed = ", ".join(examined[:4])
+    return (
+        "You already examined these targets in this unchanged room: "
+        f"{listed}. Choose a different action."
+    )
+
+
+def _normalize_observation_fingerprint(observation_text: str) -> str:
+    return " ".join(observation_text.split()).strip().lower()
+
+
+def _guard_room_context_command(
+    *,
+    command: str,
+    observation_text: str,
+    current_room: str | None,
+    exits: tuple[str, ...],
+    item_descriptors: tuple[str, ...],
+    map_memory: MapMemory,
+    history: tuple[tuple[str, str], ...],
+    use_exploration_assist: bool,
+) -> str:
+    normalized = " ".join(command.strip().upper().split())
+    if not normalized:
+        return command
+    if normalized in {"N", "S", "E", "W"} or normalized.startswith("GO "):
+        return normalized
+
+    direction_aliases = {
+        "N": "N",
+        "NORTH": "N",
+        "S": "S",
+        "SOUTH": "S",
+        "E": "E",
+        "EAST": "E",
+        "W": "W",
+        "WEST": "W",
+    }
+    search_match = re.match(r"^SEARCH\s+([A-Z]+)$", normalized)
+    if search_match:
+        direction = direction_aliases.get(search_match.group(1))
+        if direction is not None:
+            return direction
+
+    target_match = re.match(r"^(EXAMINE|SEARCH|OPEN|MOVE|TAKE|GET|WEAR)\s+(.+)$", normalized)
+    if target_match is None:
+        return normalized
+    if not item_descriptors:
+        return normalized
+    target = target_match.group(2).strip()
+    if _target_tokens_present_in_observation(target=target, observation_text=observation_text):
+        return normalized
+    if use_exploration_assist and current_room is not None:
+        return _movement_escape_command(
+            current_room=current_room,
+            exits=exits,
+            map_memory=map_memory,
+            history=history,
+        )
+    return "SEARCH ROOM"
+
+
+def _target_tokens_present_in_observation(*, target: str, observation_text: str) -> bool:
+    normalized_target = " ".join(target.upper().split())
+    if normalized_target in {"ROOM", "AREA", "HERE"}:
+        return True
+    target_tokens = {
+        token
+        for token in re.findall(r"[A-Z0-9']+", normalized_target)
+        if token not in {"A", "AN", "THE"}
+    }
+    if not target_tokens:
+        return False
+    observation_tokens = set(re.findall(r"[A-Z0-9']+", observation_text.upper()))
+    return target_tokens.issubset(observation_tokens)
 
 
 def _command_target_tokens(command: str) -> tuple[str, ...]:

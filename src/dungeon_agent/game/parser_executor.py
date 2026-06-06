@@ -57,15 +57,30 @@ _DIRECTION_TO_ENUM = {
     "WEST": Direction.WEST,
 }
 
+_APOSTROPHE_VARIANTS = str.maketrans(
+    {
+        "’": "'",
+        "‘": "'",
+        "ʼ": "'",
+        "‛": "'",
+        "`": "'",
+        "´": "'",
+    }
+)
+
+
+def _normalize_apostrophes(text: str) -> str:
+    return text.translate(_APOSTROPHE_VARIANTS)
+
 
 def _tokens_without_articles(text: str) -> set[str]:
-    normalized = text.upper().replace("’", "'").replace("`", "'")
+    normalized = _normalize_apostrophes(text).upper()
     tokens = {token for token in re.findall(r"[A-Z0-9']+", normalized) if token and token not in _ARTICLES}
     return tokens
 
 
 def _normalize_tokens(command: str) -> list[str]:
-    normalized = " ".join(command.upper().replace("’", "'").replace("`", "'").strip().split())
+    normalized = " ".join(_normalize_apostrophes(command).upper().strip().split())
     return [token for token in re.findall(r"[A-Z0-9']+", normalized) if token]
 
 
@@ -284,7 +299,15 @@ class ParserExecutorEngine(GameEngine):
             return "It is too dark to search effectively."
 
         target_key = _clean_phrase(target_phrase)
-        if target_key in {"", "ROOM", "AREA"}:
+        current_room = world.rooms[world.player.current_room_id]
+        room_aliases = {
+            "",
+            "ROOM",
+            "AREA",
+            _clean_phrase(current_room.name),
+            _clean_phrase(current_room.room_id.replace("_", " ")),
+        }
+        if target_key in room_aliases:
             hidden_count = len(self._hidden_room_items())
             if hidden_count:
                 return (
